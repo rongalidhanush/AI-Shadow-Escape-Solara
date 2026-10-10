@@ -1,10 +1,10 @@
-"""Solara web application for AI Shadow Escape."""
+"""Solara web application — AI Shadow Escape: Upgraded Edition."""
 
 from __future__ import annotations
 
 import solara
 
-from game import Difficulty, GameEngine
+from game import Difficulty, GameEngine, GameSnapshot, Heuristic
 from ui.board import GameBoard
 from ui.controls import ControlPanel
 from ui.dashboard import Header, MissionMessage
@@ -22,59 +22,71 @@ def Page():
         engine_ref.current = GameEngine(Difficulty.NORMAL)
 
     engine: GameEngine = engine_ref.current
-    _revision_marker = revision.value
-    snapshot = engine.snapshot()
+    _rev = revision.value          # subscribe to reactive
+    snapshot: GameSnapshot = engine.snapshot()
 
     def refresh() -> None:
         revision.value = revision.value + 1
 
+    # ── Mission actions ────────────────────────────────────────────────────────
     def start() -> None:
-        engine.start()
-        refresh()
+        engine.start(); refresh()
 
     def pause() -> None:
-        engine.pause()
-        refresh()
+        engine.pause(); refresh()
 
     def resume() -> None:
-        engine.resume()
-        refresh()
+        engine.resume(); refresh()
 
     def restart() -> None:
-        engine.restart()
-        refresh()
+        engine.restart(); refresh()
 
     def scan() -> None:
-        engine.scan()
-        refresh()
+        engine.scan(); refresh()
 
     def new_maze() -> None:
-        engine.new_maze()
-        refresh()
+        engine.new_maze(); refresh()
 
     def move(direction: tuple[int, int]) -> None:
-        engine.move_player(direction)
-        refresh()
+        engine.move_player(direction); refresh()
 
+    def undo() -> None:
+        engine.undo_move(); refresh()
+
+    def activate_cloak() -> None:
+        engine.activate_cloak(); refresh()
+
+    # ── Settings actions ───────────────────────────────────────────────────────
     def set_difficulty(difficulty: Difficulty) -> None:
         engine.set_difficulty(difficulty)
         engine.start()
         refresh()
 
-    def set_lab_mode(enabled: bool) -> None:
-        engine.toggle_lab_mode(enabled)
+    def set_level(index: int) -> None:
+        engine.set_level(index)
         refresh()
+
+    def set_heuristic(heuristic: Heuristic) -> None:
+        engine.set_heuristic(heuristic)
+        refresh()
+
+    def set_lab_mode(enabled: bool) -> None:
+        engine.toggle_lab_mode(enabled); refresh()
 
     def set_show_paths(enabled: bool) -> None:
-        engine.toggle_paths(enabled)
-        refresh()
+        engine.toggle_paths(enabled); refresh()
 
+    # ── Render ─────────────────────────────────────────────────────────────────
     solara.HTML(tag="div", unsafe_innerHTML=PAGE_CSS)
+
     with solara.Div(classes=["ase-root"]):
-        Header(snapshot)
         with solara.Div(classes=["ase-shell"]):
+            Header(snapshot)
             MissionMessage(snapshot)
+
             with solara.Div(classes=["ase-grid-layout"]):
+
+                # Left column — controls + scan
                 with solara.Div(classes=["ase-panel"]):
                     ControlPanel(
                         snapshot,
@@ -88,15 +100,22 @@ def Page():
                         on_difficulty=set_difficulty,
                         on_lab_mode=set_lab_mode,
                         on_show_paths=set_show_paths,
+                        on_undo=undo,
+                        on_cloak=activate_cloak,
+                        on_heuristic=set_heuristic,
+                        on_level=set_level,
                     )
                     ScanPanel(snapshot)
+
+                # Centre column — board + overlays + lab
                 with solara.Div():
                     GameBoard(snapshot)
                     EndPanel(snapshot, play_again=restart)
                     LabPanel(snapshot)
                     ExplanationPanel()
+
+                # Right column — credits + AI status + live metrics
                 with solara.Div(style={"display": "grid", "gap": "12px"}):
                     CreditsPanel()
                     AiStatus(snapshot)
                     LiveMetrics(snapshot)
-

@@ -1,4 +1,4 @@
-"""Explanatory and lab evaluation panels."""
+"""Panels — fullscreen win/loss overlay, BFS vs A* lab panel, scan panel, credits."""
 
 from __future__ import annotations
 
@@ -9,45 +9,81 @@ import solara
 from game.state import GameSnapshot
 
 
-def _row(label: str, value: str | int) -> str:
-    return f'<div class="ase-row"><span class="ase-muted">{html.escape(label)}</span><b>{html.escape(str(value))}</b></div>'
+def _row(label: str, value: str | int, css_class: str = "") -> str:
+    val = html.escape(str(value))
+    if css_class:
+        val = f'<b class="{css_class}">{val}</b>'
+    else:
+        val = f"<b>{val}</b>"
+    return (
+        f'<div class="ase-row">'
+        f'<span class="ase-muted">{html.escape(label)}</span>'
+        f"{val}</div>"
+    )
+
+
+# ── Lab Panel ─────────────────────────────────────────────────────────────────
+
+def _lab_agent_col(agent, label_color: str) -> str:
+    emoji = {"Hunter": "👁", "Interceptor": "⚡", "Flanker": "🔮"}.get(agent.role, "?")
+    # BFS vs A* delta comparison
+    a_nodes = agent.nodes_explored
+    b_nodes = agent.bfs_nodes_explored
+    delta = b_nodes - a_nodes
+    delta_html = (
+        f'<span class="ase-delta-up">▲ BFS +{delta}</span>'
+        if delta > 0
+        else f'<span class="ase-delta-down">▼ BFS {delta}</span>'
+    )
+    a_path = agent.path_length
+    b_path = agent.bfs_path_length
+
+    return (
+        f'<div class="ase-agent-col">'
+        f'<div class="ase-panel-title" style="color:{label_color};">{emoji} {html.escape(agent.role)}</div>'
+        '<div class="ase-readout">'
+        + _row("Open Set", agent.open_set_count)
+        + _row("Closed Set", agent.closed_set_count)
+        + _row("Current Node", str(agent.current_node))
+        + _row("A* Path Len", a_path)
+        + _row("A* Nodes", a_nodes)
+        + _row("BFS Nodes", b_nodes)
+        + _row("BFS Path Len", b_path)
+        + _row("BFS vs A*", "", )
+        + f'<div class="ase-row"><span class="ase-muted">Node Δ</span>{delta_html}</div>'
+        + _row("Replans", agent.recalculations)
+        + "</div></div>"
+    )
+
+
+AGENT_COLORS = ["#ff6080", "#ff9020", "#c08fff"]
 
 
 @solara.component
 def LabPanel(snapshot: GameSnapshot):
     if not snapshot.lab_mode:
         return
-    hunter = snapshot.agents[0]
-    interceptor = snapshot.agents[1]
+    cols_html = "".join(
+        _lab_agent_col(agent, AGENT_COLORS[i % len(AGENT_COLORS)])
+        for i, agent in enumerate(snapshot.agents)
+    )
     html_text = (
         '<div class="ase-panel" style="margin-top:12px;">'
-        '<div class="ase-panel-title">LAB EVALUATION MODE</div>'
-        '<div class="ase-code">f(n) = g(n) + h(n)<br>'
-        'g(n) = cost from start node<br>'
-        'h(n) = estimated cost to goal<br>'
-        'Manhattan: h(n) = |x1-x2| + |y1-y2|</div>'
-        '<div style="display:grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap:12px; margin-top:12px;">'
-        '<div class="ase-readout">'
-        '<div class="ase-panel-title">Hunter Search</div>'
-        + _row("Open Set Count", hunter.open_set_count)
-        + _row("Closed Set Count", hunter.closed_set_count)
-        + _row("Current Node", hunter.current_node)
-        + _row("Path Length", hunter.path_length)
-        + _row("Nodes Explored", hunter.nodes_explored)
-        + _row("Replanning Count", hunter.recalculations)
-        + "</div>"
-        '<div class="ase-readout">'
-        '<div class="ase-panel-title">Interceptor Search</div>'
-        + _row("Open Set Count", interceptor.open_set_count)
-        + _row("Closed Set Count", interceptor.closed_set_count)
-        + _row("Current Node", interceptor.current_node)
-        + _row("Path Length", interceptor.path_length)
-        + _row("Nodes Explored", interceptor.nodes_explored)
-        + _row("Replanning Count", interceptor.recalculations)
-        + "</div></div></div>"
+        '<div class="ase-panel-title">🔬 Lab Evaluation Mode</div>'
+        '<div class="ase-code">'
+        "f(n) = g(n) + h(n)<br>"
+        "g(n) = cost from start node<br>"
+        "h(n) = estimated cost to goal<br>"
+        "Manhattan: h(n) = |x₁-x₂| + |y₁-y₂|<br>"
+        "Chebyshev: h(n) = max(|x₁-x₂|, |y₁-y₂|)"
+        "</div>"
+        f'<div class="ase-lab-grid">{cols_html}</div>'
+        "</div>"
     )
     solara.HTML(tag="div", unsafe_innerHTML=html_text)
 
+
+# ── Scan Panel ────────────────────────────────────────────────────────────────
 
 @solara.component
 def ScanPanel(snapshot: GameSnapshot):
@@ -56,20 +92,33 @@ def ScanPanel(snapshot: GameSnapshot):
             tag="div",
             unsafe_innerHTML=(
                 '<div class="ase-panel" style="margin-top:12px;">'
-                '<div class="ase-panel-title">SHADOW SCAN</div>'
-                '<div class="ase-muted">Press SCAN to inspect live enemy distance, threat and path length.</div>'
-                "</div>"
+                '<div class="ase-panel-title">🔍 Shadow Scan</div>'
+                '<div class="ase-muted" style="font-size:12px;">'
+                "Press SCAN to inspect live enemy distance, threat and path length."
+                "</div></div>"
             ),
         )
         return
-    rows = []
+
+    rows_html = []
     for role, info in snapshot.scan.agents.items():
-        rows.append(
-            '<div class="ase-panel" style="margin-top:8px;">'
-            f'<div class="ase-panel-title">{html.escape(role)}</div>'
+        emoji = {"Hunter": "👁", "Interceptor": "⚡", "Flanker": "🔮"}.get(role, "?")
+        threat = str(info["threat"])
+        threat_class = (
+            "ase-danger" if threat in {"CRITICAL", "HIGH"}
+            else "ase-warn" if threat == "MEDIUM"
+            else "ase-good"
+        )
+        frozen_tag = (
+            ' <span style="color:#7ab8dc;">[FROZEN]</span>'
+            if info.get("frozen") == "Yes" else ""
+        )
+        rows_html.append(
+            f'<div class="ase-scan-agent">'
+            f'<div style="font-weight:700; margin-bottom:6px;">{emoji} {html.escape(role)}{frozen_tag}</div>'
             '<div class="ase-readout">'
             + _row("Distance", f"{info['distance']} cells")
-            + _row("Threat", info["threat"])
+            + _row("Threat", threat)
             + _row("Path Length", info["path_length"])
             + _row("Target", info["target"])
             + "</div></div>"
@@ -77,29 +126,32 @@ def ScanPanel(snapshot: GameSnapshot):
     solara.HTML(
         tag="div",
         unsafe_innerHTML=(
-            '<div class="ase-panel" style="margin-top:12px; border-color:rgba(49,216,255,.55);">'
-            '<div class="ase-panel-title">SHADOW SCAN</div>'
-            + "".join(rows)
+            '<div class="ase-panel" style="margin-top:12px; border-color:rgba(49,216,255,.5);">'
+            '<div class="ase-panel-title">🔍 Shadow Scan</div>'
+            + "".join(rows_html)
             + "</div>"
         ),
     )
 
+
+# ── Explanation Panel ─────────────────────────────────────────────────────────
 
 @solara.component
 def ExplanationPanel():
     solara.Markdown(
         """
 <details class="ase-panel" style="margin-top:12px;">
-<summary class="ase-panel-title">HOW THE AI WORKS</summary>
+<summary class="ase-panel-title">❓ How the AI Works</summary>
 
-1. The maze is represented as a grid.
-2. The player occupies one grid cell.
-3. AI agents detect the player's position.
-4. A* searches for an efficient path.
-5. Manhattan distance estimates the remaining cost.
-6. AI agents move along the calculated path.
-7. When the player moves or gates change, paths are recalculated.
-8. The player must reach the exit before being intercepted.
+1. The maze is a grid with walls and dynamic gates.
+2. Three AI agents each run their own A* search every move.
+3. **Hunter 👁** — targets your current cell directly.
+4. **Interceptor ⚡** — predicts your next position (2 steps ahead in last direction).
+5. **Flanker 🔮** — targets the EXIT to cut off your escape route.
+6. Manhattan or Chebyshev distance estimates the remaining cost.
+7. When you move or a gate changes, all agents replan.
+8. Collect the ✨ Cloak token to freeze all agents for 5 moves.
+9. You have 3 lives — each capture costs one life and respawns you.
 
 </details>
 """,
@@ -107,41 +159,71 @@ def ExplanationPanel():
     )
 
 
+# ── Credits Panel ─────────────────────────────────────────────────────────────
+
 @solara.component
 def CreditsPanel():
     solara.HTML(
         tag="div",
         unsafe_innerHTML=(
             '<div class="ase-panel ase-credit">'
-            '<div class="ase-panel-title" style="color:#2ee889;">PROJECT CREDITS</div>'
+            '<div class="ase-panel-title" style="color:#2ee889;">🎓 Project Credits</div>'
             '<div class="ase-readout">'
             + _row("Name", "Dhanush Naidu")
-            + _row("Registration Number", "BL.S.U4AIE25241")
+            + _row("Reg. Number", "BL.S.U4AIE25241")
             + _row("Course", "Fundamentals of AIE")
-            + _row("Project", "AI Shadow Escape")
+            + _row("Project", "AI Shadow Escape — v2")
+            + _row("AI Concepts", "A*, BFS, Multi-Agent, Dynamic Env.")
             + "</div></div>"
         ),
     )
 
 
+# ── End / Win / Loss Overlay ──────────────────────────────────────────────────
+
 @solara.component
 def EndPanel(snapshot: GameSnapshot, play_again):
     if snapshot.status.value not in {"MISSION COMPLETE", "MISSION FAILED"}:
         return
+
     won = snapshot.status.value == "MISSION COMPLETE"
-    title = "MISSION COMPLETE" if won else "MISSION FAILED"
-    subtitle = "You escaped the AI shadows." if won else "The shadows intercepted you."
-    css_class = "ase-good" if won else "ase-danger"
-    html_text = (
-        '<div class="ase-panel" style="margin-top:12px;">'
-        f'<div class="ase-stat-value {css_class}">{title}</div>'
-        f'<div class="ase-muted" style="margin-bottom:12px;">{subtitle}</div>'
-        '<div class="ase-readout">'
-        + _row("Final Score", snapshot.score)
-        + _row("Moves", snapshot.moves)
-        + _row("A* Recalculations", snapshot.route_recalculations)
-        + _row("Survival Time", f"{snapshot.elapsed_seconds:.1f}s")
-        + "</div></div>"
+    title = "🏆 MISSION COMPLETE" if won else "💀 MISSION FAILED"
+    subtitle = "You outfoxed the AI shadows!" if won else "The shadows intercepted you."
+    border_color = "#2ee889" if won else "#ff4060"
+    title_class = "ase-good" if won else "ase-danger"
+
+    score_items = [
+        ("Final Score", str(snapshot.score), "ase-good"),
+        ("Moves", str(snapshot.moves), ""),
+        ("Lives Left", "❤️" * snapshot.lives, ""),
+        ("Survival", f"{snapshot.elapsed_seconds:.1f}s", ""),
+        ("A* Replans", str(snapshot.route_recalculations), "ase-warn"),
+        ("Gates Changed", str(snapshot.gates_changed), ""),
+    ]
+    score_grid = "".join(
+        f'<div class="ase-score-item">'
+        f'<div class="ase-score-item-label">{html.escape(lbl)}</div>'
+        f'<div class="ase-score-item-value {cls}">{html.escape(val)}</div>'
+        "</div>"
+        for lbl, val, cls in score_items
     )
-    solara.HTML(tag="div", unsafe_innerHTML=html_text)
-    solara.Button("PLAY AGAIN", on_click=play_again, color="success", style={"width": "100%", "marginTop": "8px"})
+
+    solara.HTML(
+        tag="div",
+        unsafe_innerHTML=(
+            '<div class="ase-overlay">'
+            f'<div class="ase-overlay-card" style="border-color:{border_color}; '
+            f'box-shadow: 0 0 60px {border_color}44;">'
+            f'<div class="ase-overlay-title {title_class}">{title}</div>'
+            f'<div class="ase-overlay-sub">{html.escape(subtitle)}</div>'
+            f'<div class="ase-score-grid">{score_grid}</div>'
+            "</div></div>"
+        ),
+    )
+    with solara.Column(style={"alignItems": "center", "marginTop": "12px"}):
+        solara.Button(
+            "▶ PLAY AGAIN",
+            on_click=play_again,
+            color="success",
+            style={"width": "100%", "minHeight": "44px", "fontWeight": "800", "fontSize": "15px"},
+        )

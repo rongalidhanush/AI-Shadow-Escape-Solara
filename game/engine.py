@@ -1,19 +1,30 @@
-"""UI-independent AI Shadow Escape game engine."""
+"""UI-independent AI Shadow Escape game engine — Upgraded Edition."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
 import time
-from typing import Dict, Iterable, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .agents import Player, Pursuer
 from .gates import GateSystem
-from .maze import COLS, ROWS, LEVELS, generate_walls
+from .maze import LEVELS, LevelSpec, generate_walls
 from .pathfinding import astar, manhattan, path_length
 from .scoring import Metrics, danger_label, danger_value
-from .state import AgentSnapshot, Difficulty, GameSnapshot, GameStatus, ScanReport
+from .state import (
+    AgentSnapshot,
+    Difficulty,
+    GameSnapshot,
+    GameStatus,
+    Heuristic,
+    ScanReport,
+)
 
 Cell = Tuple[int, int]
+
+CLOAK_FREEZE_MOVES = 5   # pursuer freeze duration
+MAX_LIVES = 3
 
 
 @dataclass(frozen=True)
@@ -27,17 +38,19 @@ class DifficultyConfig:
 
 
 DIFFICULTY_CONFIG: dict[Difficulty, DifficultyConfig] = {
-    Difficulty.EASY: DifficultyConfig(-0.06, 7, 1, 3, 5, False),
+    Difficulty.EASY:   DifficultyConfig(-0.06, 8, 1, 4, 6, False),
     Difficulty.NORMAL: DifficultyConfig(-0.02, 5, 1, 3, 4, True),
-    Difficulty.HARD: DifficultyConfig(0.03, 4, 1, 2, 3, True),
+    Difficulty.HARD:   DifficultyConfig(0.03,  4, 1, 2, 3, True),
+    Difficulty.EXPERT: DifficultyConfig(0.06,  3, 2, 1, 2, True),
 }
 
 
 class GameEngine:
-    """Plain Python engine that owns state, AI decisions, gates and scoring."""
+    """Plain Python engine that owns state, AI decisions, gates, scoring and new power-ups."""
 
     def __init__(self, difficulty: Difficulty = Difficulty.NORMAL):
         self.difficulty = difficulty
+        self.heuristic = Heuristic.MANHATTAN
         self.level_index = 0
         self.seed_counter = 0
         self.status = GameStatus.MENU
@@ -45,9 +58,9 @@ class GameEngine:
         self.show_paths = True
         self.message = "System ready. Start the mission to activate A* pursuit."
         self.start_time = time.monotonic()
-        self.end_time: float | None = None
+        self.end_time: Optional[float] = None
         self.player: Player
-        self.pursuers: list[Pursuer]
+        self.pursuers: List[Pursuer]
         self.base_walls: Set[Cell] = set()
         self.walls: Set[Cell] = set()
         self.safe_zone: Cell = (0, 0)
@@ -55,14 +68,34 @@ class GameEngine:
         self.metrics = Metrics()
         self.current_score = 0
         self.last_scan: ScanReport = ScanReport(False, {})
+        # Lives & power-up
+        self.lives = MAX_LIVES
+        self.cloak_active = False
+        self.cloak_moves_left = 0
+        self.cloak_collected = False   # becomes True once player steps on power-up
+        self.power_up_cell: Optional[Cell] = None
         self.load_level()
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def set_difficulty(self, difficulty: Difficulty) -> None:
         self.difficulty = difficulty
         self.new_maze()
 
+    def set_heuristic(self, heuristic: Heuristic) -> None:
+        self.heuristic = heuristic
+        self._recalculate_all("Heuristic changed. A* routes recalculated.")
+
+    def set_level(self, index: int) -> None:
+        self.level_index = max(0, min(index, len(LEVELS) - 1))
+        self.seed_counter = 0
+        self.load_level()
+        self.status = GameStatus.PLAYING
+        self.message = f"Level {self.level_index + 1}: {LEVELS[self.level_index].name} loaded."
+
     def start(self) -> None:
         if self.status in {GameStatus.WON, GameStatus.LOST}:
+            self.lives = MAX_LIVES
             self.load_level()
         self.status = GameStatus.PLAYING
         self.start_time = time.monotonic()
@@ -82,11 +115,13 @@ class GameEngine:
             self.message = "Mission resumed. Pursuit paths restored."
 
     def restart(self) -> None:
+        self.lives = MAX_LIVES
         self.load_level(seed_offset=0)
         self.status = GameStatus.PLAYING
         self.message = "Mission restarted with the same maze profile."
 
     def new_maze(self) -> None:
+        self.lives = MAX_LIVES
         self.load_level(seed_offset=1)
         self.status = GameStatus.PLAYING
         self.message = "New maze generated. A* routes recalculated."
@@ -98,19 +133,19 @@ class GameEngine:
         self.show_paths = enabled
 
     def load_level(self, seed_offset: int = 1) -> None:
-        spec = LEVELS[self.level_index]
+        spec: LevelSpec = LEVELS[self.level_index]
         self.seed_counter += seed_offset
         config = DIFFICULTY_CONFIG[self.difficulty]
-        density = max(0.08, min(0.35, spec.wall_density + config.wall_density_delta))
-        seed = 1000 + self.seed_counter
-        self.base_walls = generate_walls(spec, COLS, ROWS, seed, density)
+        density = max(0.08, min(0.38, spec.wall_density + config.wall_density_delta))
+        seed = 1000 + self.seed_counter + self.level_index * 100
+        self.base_walls = generate_walls(spec, seed, density)
         self.walls = set(self.base_walls)
         self.safe_zone = spec.safe_zone
         self.gates = GateSystem(set(spec.gate_candidates), set())
         self.player = Player(spec.start, spec.start)
         self.pursuers = [
-            Pursuer(f"Shadow {index + 1}", cell, role, index)
-            for index, (cell, role) in enumerate(spec.pursuers)
+            Pursuer(f"Shadow {idx + 1}", cell, role, idx)
+            for idx, (cell, role) in enumerate(spec.pursuers)
         ]
         self.metrics = Metrics()
         self.current_score = 0
@@ -118,6 +153,12 @@ class GameEngine:
         self.end_time = None
         self.last_scan = ScanReport(False, {})
         self.status = GameStatus.MENU
+        # Pick a random power-up location from candidates
+        candidates = [c for c in spec.power_up_candidates if c not in self.base_walls]
+        self.power_up_cell = random.choice(candidates) if candidates else None
+        self.cloak_active = False
+        self.cloak_moves_left = 0
+        self.cloak_collected = False
         self._recalculate_all("Initial A* paths calculated.")
 
     def move_player(self, direction: Cell) -> bool:
@@ -125,12 +166,22 @@ class GameEngine:
             self.message = "Start or resume the mission before moving."
             return False
 
-        moved = self.player.try_move(direction[0], direction[1], self.walls, COLS, ROWS)
+        moved = self.player.try_move(direction[0], direction[1], self.walls, *self._dims())
         self.metrics.player_distance = self.player.distance_travelled
         if not moved:
             self.metrics.obstacle_collisions += 1
             self.message = "Blocked cell. Wall or closed gate detected."
             return False
+
+        # Cloak countdown
+        if self.cloak_active:
+            self.cloak_moves_left -= 1
+            if self.cloak_moves_left <= 0:
+                self.cloak_active = False
+                self.message = "Cloak worn off. Shadows resuming pursuit."
+
+        # Check power-up collection
+        self._maybe_collect_power_up()
 
         self._update_elapsed()
         self._recalculate_all("Player moved. A* routes replanned.")
@@ -143,6 +194,31 @@ class GameEngine:
         self._check_victory_or_capture()
         return True
 
+    def undo_move(self) -> bool:
+        """Undo the last player move (costs score)."""
+        if self.status != GameStatus.PLAYING:
+            return False
+        if not self.player.undo():
+            self.message = "No move to undo."
+            return False
+        self.metrics.undo_used += 1
+        self._recalculate_all("Move undone. A* routes recalculated.")
+        self._update_score_preview()
+        self.message = f"Move undone. (-{5} score penalty)"
+        return True
+
+    def activate_cloak(self) -> bool:
+        """Activate cloak power-up — freeze all pursuers for CLOAK_FREEZE_MOVES moves."""
+        if not self.cloak_collected or self.cloak_active:
+            return False
+        self.cloak_active = True
+        self.cloak_moves_left = CLOAK_FREEZE_MOVES
+        self.metrics.cloak_used += 1
+        for p in self.pursuers:
+            p.freeze(CLOAK_FREEZE_MOVES)
+        self.message = f"CLOAK ACTIVE! Shadows frozen for {CLOAK_FREEZE_MOVES} moves."
+        return True
+
     def scan(self) -> ScanReport:
         self.metrics.scans_used += 1
         agents: Dict[str, Dict[str, str | int]] = {}
@@ -153,51 +229,73 @@ class GameEngine:
                 "threat": danger_label(dist),
                 "path_length": path_length(agent.path),
                 "target": str(agent.current_target),
+                "frozen": "Yes" if agent.frozen else "No",
             }
         self.last_scan = ScanReport(True, agents)
         self.message = "Shadow Scan complete. Enemy distances and path lengths updated."
         self._update_score_preview()
         return self.last_scan
 
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _dims(self) -> tuple[int, int]:
+        spec = LEVELS[self.level_index]
+        return spec.cols, spec.rows
+
     def _target_for(self, pursuer: Pursuer) -> Cell:
+        if pursuer.role == "Flanker":
+            return self.safe_zone          # cut off the exit
         if pursuer.role == "Interceptor":
             return self._predicted_target()
         return self.player.cell
 
     def _predicted_target(self) -> Cell:
+        cols, rows = self._dims()
         x, y = self.player.cell
         dx, dy = self.player.last_direction
-        predicted = (max(0, min(COLS - 1, x + dx * 2)), max(0, min(ROWS - 1, y + dy * 2)))
+        predicted = (
+            max(0, min(cols - 1, x + dx * 2)),
+            max(0, min(rows - 1, y + dy * 2)),
+        )
         if predicted in self.walls:
             return self.player.cell
         return predicted
 
     def _recalculate_all(self, message: str) -> None:
+        cols, rows = self._dims()
+        h = self.heuristic.value
         for pursuer in self.pursuers:
             others = {other.cell for other in self.pursuers if other is not pursuer}
-            pursuer.recalculate(self._target_for(pursuer), self.walls, COLS, ROWS, others)
+            pursuer.recalculate(self._target_for(pursuer), self.walls, cols, rows, others, h)
         self.metrics.route_recalculations += len(self.pursuers)
         self.message = message
 
     def _move_pursuers_after_player(self) -> None:
         config = DIFFICULTY_CONFIG[self.difficulty]
+        cols, rows = self._dims()
+        h = self.heuristic.value
         if self.player.moves <= config.launch_grace_moves:
-            self.message = f"Launch grace active. Shadows engage in {config.launch_grace_moves - self.player.moves + 1} move(s)."
+            remaining = config.launch_grace_moves - self.player.moves + 1
+            self.message = f"Launch grace active. Shadows engage in {remaining} move(s)."
             return
         if (self.player.moves - config.launch_grace_moves) % config.enemy_move_period != 0:
-            self.message = "A* routes updated. Shadows are tracking before their next pursuit step."
+            self.message = "A* routes updated. Shadows tracking before next pursuit step."
             return
         for _ in range(config.enemy_steps):
             for pursuer in self.pursuers:
                 target = self._target_for(pursuer)
                 others = {other.cell for other in self.pursuers if other is not pursuer}
-                pursuer.move_one_step(target, self.walls, COLS, ROWS, others)
+                pursuer.move_one_step(target, self.walls, cols, rows, others, h)
                 self.metrics.enemy_steps += 1
                 if pursuer.role == "Interceptor" and config.interceptor_replans_every_step:
-                    pursuer.recalculate(self._target_for(pursuer), self.walls, COLS, ROWS, others)
+                    pursuer.recalculate(self._target_for(pursuer), self.walls, cols, rows, others, h)
+                    self.metrics.route_recalculations += 1
+                # Flanker replans every step too (dynamic blocking)
+                if pursuer.role == "Flanker":
+                    pursuer.recalculate(self._target_for(pursuer), self.walls, cols, rows, others, h)
                     self.metrics.route_recalculations += 1
                 if pursuer.cell == self.player.cell:
-                    self._lose()
+                    self._capture()
                     return
 
     def _maybe_update_gate(self) -> None:
@@ -207,6 +305,7 @@ class GameEngine:
         self.toggle_next_gate()
 
     def toggle_next_gate(self) -> bool:
+        cols, rows = self._dims()
         candidates = [
             cell
             for cell in self.gates.ordered_candidates()
@@ -224,7 +323,7 @@ class GameEngine:
             proposed = set(self.gates.closed)
             proposed.add(cell)
             proposed_walls = set(self.base_walls) | proposed
-            changed = bool(astar(self.player.cell, self.safe_zone, proposed_walls, COLS, ROWS))
+            changed = bool(astar(self.player.cell, self.safe_zone, proposed_walls, cols, rows))
             if changed:
                 self.gates.closed.add(cell)
                 gate_message = "Gate closed. A* network forced to replan."
@@ -236,25 +335,52 @@ class GameEngine:
             self._recalculate_all(gate_message)
         return changed
 
+    def _maybe_collect_power_up(self) -> None:
+        if self.power_up_cell and self.player.cell == self.power_up_cell:
+            self.cloak_collected = True
+            self.power_up_cell = None
+            self.message = "🔮 CLOAK collected! Press ACTIVATE CLOAK to freeze shadows."
+
     def _check_victory_or_capture(self) -> bool:
         if self.player.cell == self.safe_zone:
             self._win()
             return True
         if self.player.cell in {p.cell for p in self.pursuers}:
-            self._lose()
+            self._capture()
             return True
         return False
+
+    def _capture(self) -> None:
+        """Handle a capture event — deduct a life or end the game."""
+        if self.status != GameStatus.PLAYING:
+            return
+        self.lives -= 1
+        self.metrics.lives_lost += 1
+        if self.lives <= 0:
+            self._lose()
+        else:
+            # Respawn at start — reset player but keep maze
+            spec = LEVELS[self.level_index]
+            self.player = Player(spec.start, spec.start)
+            self.cloak_active = False
+            self.cloak_moves_left = 0
+            self.message = (
+                f"Captured! {self.lives} {'life' if self.lives == 1 else 'lives'} remaining. "
+                "Respawning at start…"
+            )
+            self._recalculate_all(self.message)
 
     def _win(self) -> None:
         if self.status != GameStatus.PLAYING:
             return
         self.metrics.successful_escape = True
         self._update_elapsed()
-        optimal = path_length(astar(self.player.start_cell, self.safe_zone, self.walls, COLS, ROWS))
+        cols, rows = self._dims()
+        optimal = path_length(astar(self.player.start_cell, self.safe_zone, self.walls, cols, rows))
         self.current_score = self.metrics.final_score(optimal)
         self.status = GameStatus.WON
         self.end_time = time.monotonic()
-        self.message = "MISSION COMPLETE: You escaped the AI shadows."
+        self.message = "🏆 MISSION COMPLETE: You escaped the AI shadows!"
 
     def _lose(self) -> None:
         if self.status != GameStatus.PLAYING:
@@ -264,7 +390,7 @@ class GameEngine:
         self.current_score = 0
         self.status = GameStatus.LOST
         self.end_time = time.monotonic()
-        self.message = "MISSION FAILED: The shadows intercepted you."
+        self.message = "💀 MISSION FAILED: The shadows intercepted you."
 
     def _update_elapsed(self) -> None:
         if self.status == GameStatus.PLAYING:
@@ -275,8 +401,19 @@ class GameEngine:
         survival = int(self.metrics.elapsed_seconds * 4)
         movement = self.player.moves * 12
         danger_bonus = max(0, nearest * 3)
-        penalties = self.metrics.scans_used * 8 + self.metrics.obstacle_collisions * 15
-        self.current_score = max(0, 250 + survival + movement + danger_bonus + self.metrics.gates_changed * 15 - penalties)
+        penalties = (
+            self.metrics.scans_used * 8
+            + self.metrics.obstacle_collisions * 15
+            + self.metrics.undo_used * 5
+        )
+        lives_bonus = (MAX_LIVES - self.metrics.lives_lost) * 80
+        self.current_score = max(
+            0,
+            250 + survival + movement + danger_bonus
+            + self.metrics.gates_changed * 15
+            + lives_bonus
+            - penalties,
+        )
 
     def _nearest_distance(self) -> int:
         distances = [manhattan(p.cell, self.player.cell) for p in self.pursuers]
@@ -285,9 +422,11 @@ class GameEngine:
     def snapshot(self) -> GameSnapshot:
         self._update_elapsed()
         nearest = self._nearest_distance()
+        spec = LEVELS[self.level_index]
         agents = []
         for pursuer in self.pursuers:
             report = pursuer.last_report
+            bfs_report = pursuer.last_bfs_report
             agents.append(
                 AgentSnapshot(
                     name=pursuer.name,
@@ -302,14 +441,19 @@ class GameEngine:
                     current_node=report.current_node if report else None,
                     nodes_explored=report.nodes_explored if report else 0,
                     recalculations=pursuer.route_recalculations,
+                    frozen=pursuer.frozen,
+                    bfs_nodes_explored=bfs_report.nodes_explored if bfs_report else 0,
+                    bfs_path_length=bfs_report.path_length if bfs_report else 0,
                 )
             )
         return GameSnapshot(
             status=self.status,
             difficulty=self.difficulty,
-            cols=COLS,
-            rows=ROWS,
-            level_name=LEVELS[self.level_index].name,
+            heuristic=self.heuristic,
+            cols=spec.cols,
+            rows=spec.rows,
+            level_index=self.level_index,
+            level_name=spec.name,
             player=self.player.cell,
             exit_cell=self.safe_zone,
             walls=set(self.walls),
@@ -329,8 +473,16 @@ class GameEngine:
             message=self.message,
             lab_mode=self.lab_mode,
             show_paths=self.show_paths,
+            lives=self.lives,
+            cloak_active=self.cloak_active,
+            cloak_moves_left=self.cloak_moves_left,
+            cloak_collected=self.cloak_collected,
+            undo_available=self.player.prev_cell is not None,
+            power_up_cell=self.power_up_cell,
             scan=self.last_scan,
         )
+
+    # ── Test helpers ──────────────────────────────────────────────────────────
 
     def force_player_to_exit_for_test(self) -> None:
         self.player.cell = self.safe_zone
@@ -338,4 +490,4 @@ class GameEngine:
 
     def force_collision_for_test(self) -> None:
         self.pursuers[0].cell = self.player.cell
-        self._lose()
+        self._capture()
